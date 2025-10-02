@@ -1,0 +1,17 @@
+log_errors_to_file("errors.log")
+
+function main():
+    try:
+     username = get_input("username")
+     password = get_input("password")
+
+        if username == "admin" AND password == "secret123":
+            show_message("Login Successful")
+        else:
+            show_message("Invalid username or password")
+
+    except AnyError as e:
+        write_to_log("Error occcured: " + e)
+        show_message("An unexpected error occured. Please try again later. ")
+
+main()
