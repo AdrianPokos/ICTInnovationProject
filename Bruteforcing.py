@@ -1,56 +1,31 @@
 """
-Single-file defensive brute-force protection example (Flask).
-Includes:
- - MemoryStore and RedisStore implementations
- - choose_store helper that picks Redis if available/reachable
- - login endpoint with per-IP limits, per-user failures, lockout, backoff
- - admin/status endpoint to inspect counters
+Brute-force protection
 
-Run:
-    pip install flask redis
-    python Bruteforcing.py
+This is a self-contained CLI simulator of the same defensive logic:
+- per-IP counters
+- per-username failures and temporary lockout
+- exponential backoff
+- admin/status view
 
-If you don't have Redis installed locally, the script will automatically use the in-memory store.
+No external dependencies. Run with the Python interpreter in a virtualenv:
+    python bruteforce_simulator.py --help
 """
 
-from flask import Flask, request, jsonify
 import time
-import logging
+import argparse
+import random
+import sys
 
-# optional Redis module detection
-try:
-    import redis
-    REDIS_MODULE_AVAILABLE = True
-except ImportError:
-    REDIS_MODULE_AVAILABLE = False
-
-# --- Configuration ---
+# --- Configuration (same semantics as before) ---
 IP_MAX_ATTEMPTS = 30
 IP_WINDOW_SECONDS = 60 * 5    # 5 minutes
 USER_MAX_ATTEMPTS = 5
 USER_LOCK_SECONDS = 60 * 15   # 15 minutes
 BACKOFF_BASE = 1.5
 MAX_BACKOFF_SECONDS = 8
-USE_REDIS = True              # set False to force MemoryStore
-REDIS_URL = "redis://localhost:6379/0"
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("bruteforce-protect")
-
-app = Flask(__name__)
-
-# --- Storage classes ---
-class Store:
-    def incr(self, key, expiration=None):
-        raise NotImplementedError
-    def get(self, key):
-        raise NotImplementedError
-    def set(self, key, value, expiration=None):
-        raise NotImplementedError
-    def delete(self, key):
-        raise NotImplementedError
-
-class MemoryStore(Store):
+# --- In-process memory store (no Redis) ---
+class MemoryStore:
     def __init__(self):
         # key -> (int_value, expire_ts_or_None)
         self._data = {}
@@ -78,155 +53,171 @@ class MemoryStore(Store):
     def delete(self, key):
         self._data.pop(key, None)
 
-class RedisStore(Store):
-    def __init__(self, url="redis://localhost:6379/0"):
-        # assume 'redis' package is importable if this is called
-        self.r = redis.Redis.from_url(url, decode_responses=True)
-    def incr(self, key, expiration=None):
-        val = self.r.incr(key)
-        if expiration:
-            self.r.expire(key, expiration)
-        return int(val)
-    def get(self, key):
-        v = self.r.get(key)
-        return int(v) if v is not None else None
-    def set(self, key, value, expiration=None):
-        self.r.set(key, int(value), ex=expiration)
-    def delete(self, key):
-        self.r.delete(key)
+# Single global store instance
+store = MemoryStore()
 
-# --- choose_store helper (must come after store classes) ---
-def choose_store(redis_if_available=True, redis_url=REDIS_URL):
-    """
-    Try to use Redis if available and reachable; otherwise return MemoryStore.
-    """
-    if not redis_if_available:
-        logger.info("Redis disabled by config; using in-memory store")
-        return MemoryStore()
+# Helper key functions
+def ip_key(ip): return f"ip:{ip}"
+def user_failure_key(username): return f"user_fail:{username}"
+def user_lock_key(username): return f"user_lock:{username}"
+def user_backoff_key(username): return f"user_backoff:{username}"
 
-    if not REDIS_MODULE_AVAILABLE:
-        logger.info("redis python package not installed; using in-memory store")
-        return MemoryStore()
+# Utils
+def is_ip_blocked(ip):
+    count = store.get(ip_key(ip)) or 0
+    return count >= IP_MAX_ATTEMPTS
 
-    try:
-        r = redis.Redis.from_url(redis_url, decode_responses=True)
-        r.ping()
-        logger.info("Connected to Redis at %s", redis_url)
-        return RedisStore(url=redis_url)
-    except Exception as e:
-        logger.warning("Redis not reachable (%s); falling back to in-memory store", e)
-        return MemoryStore()
+def is_user_locked(username):
+    return bool(store.get(user_lock_key(username)))
 
-# choose store instance
-store = choose_store(redis_if_available=USE_REDIS, redis_url=REDIS_URL)
+def record_failed_attempt(ip, username):
+    ip_count = store.incr(ip_key(ip), expiration=IP_WINDOW_SECONDS)
+    user_failures = store.incr(user_failure_key(username), expiration=USER_LOCK_SECONDS)
+    return ip_count, user_failures
 
-# --- Helper key functions ---
-def ip_key(ip):
-    return f"ip:{ip}"
-def user_failure_key(username):
-    return f"user_fail:{username}"
-def user_lock_key(username):
-    return f"user_lock:{username}"
-def user_backoff_key(username):
-    return f"user_backoff:{username}"
+def lock_user(username):
+    store.set(user_lock_key(username), 1, expiration=USER_LOCK_SECONDS)
 
-# --- Utilities ---
-def get_remote_ip():
-    # If behind proxy, validate X-Forwarded-For appropriately in production.
-    xff = request.headers.get("X-Forwarded-For", "")
-    if xff:
-        return xff.split(",")[0].strip()
-    return request.remote_addr or "unknown"
-
-def apply_backoff_delay(username):
+def apply_backoff(username):
     backoff = store.get(user_backoff_key(username)) or 0
     if backoff <= 0:
         backoff = 1
     else:
         backoff = min(int(backoff * BACKOFF_BASE), MAX_BACKOFF_SECONDS)
     store.set(user_backoff_key(username), backoff, expiration=IP_WINDOW_SECONDS)
-    logger.debug("Applying backoff of %s seconds for user=%s", backoff, username)
+    # Simulate server-side delay (for demo we print before sleeping)
+    print(f"  [server] applying backoff {backoff}s for user={username}")
     time.sleep(backoff)
 
-def record_failed_attempt(ip, username):
-    ip_count = store.incr(ip_key(ip), expiration=IP_WINDOW_SECONDS)
-    user_failures = store.incr(user_failure_key(username), expiration=USER_LOCK_SECONDS)
-    logger.info("Failed login attempt: ip=%s (count=%d), user=%s (failures=%d)", ip, ip_count, username, user_failures)
-    return ip_count, user_failures
-
-def lock_user(username):
-    store.set(user_lock_key(username), 1, expiration=USER_LOCK_SECONDS)
-    logger.warning("User %s locked for %d seconds", username, USER_LOCK_SECONDS)
-
-def is_user_locked(username):
-    return bool(store.get(user_lock_key(username)))
-
-def is_ip_blocked(ip):
-    c = store.get(ip_key(ip)) or 0
-    return c >= IP_MAX_ATTEMPTS
-
-def reset_user_failures(username):
+def reset_user_state(username):
     store.delete(user_failure_key(username))
     store.delete(user_backoff_key(username))
 
-# --- Auth placeholder (replace with real secure auth) ---
+def get_status(username):
+    locked = bool(store.get(user_lock_key(username)))
+    failures = store.get(user_failure_key(username)) or 0
+    backoff = store.get(user_backoff_key(username)) or 0
+    return {"username": username, "locked": locked, "failures": failures, "backoff": backoff}
+
+# Demo auth check (replace as needed)
+DUMMY_DB = {"alice": "s3cret", "bob": "hunter2"}
+
 def verify_credentials(username, password):
-    # Demo only: substitute with secure hashed password check
-    DUMMY_DB = {"alice": "s3cret"}
     return DUMMY_DB.get(username) == password
 
-# --- Flask routes ---
-@app.route("/login", methods=["POST"])
-def login():
-    data = request.json or {}
-    username = (data.get("username") or "").lower().strip()
-    password = data.get("password", "")
-    ip = get_remote_ip()
-
+# Core login simulation (returns status_code, message)
+def simulate_login_attempt(ip, username, password, do_backoff=True):
+    username = (username or "").lower().strip()
     if not username:
-        return jsonify({"error": "missing username"}), 400
+        return 400, "missing username"
 
     if is_ip_blocked(ip):
-        logger.warning("Blocking requests from IP %s due to rate limit", ip)
-        return jsonify({"error": "too many requests from this IP, try later"}), 429
+        return 429, "too many requests from this IP, try later"
 
     if is_user_locked(username):
-        logger.warning("Attempt to login to locked account: %s from ip=%s", username, ip)
-        return jsonify({"error": "account temporarily locked due to failed attempts"}), 423
+        return 423, "account temporarily locked"
 
-    backoff = store.get(user_backoff_key(username)) or 0
-    if backoff:
-        logger.debug("Server-side backoff: sleeping %s for user=%s", backoff, username)
-        time.sleep(min(int(backoff), MAX_BACKOFF_SECONDS))
+    # Optional server-side backoff (non-blocking simulation in CLI we will sleep)
+    backoff_value = store.get(user_backoff_key(username)) or 0
+    if backoff_value and do_backoff:
+        print(f"  [server] current backoff {backoff_value}s for user={username}")
+        time.sleep(min(int(backoff_value), MAX_BACKOFF_SECONDS))
 
     ok = verify_credentials(username, password)
     if ok:
-        reset_user_failures(username)
-        logger.info("Successful login for user=%s from ip=%s", username, ip)
-        return jsonify({"ok": True, "message": "logged in"}), 200
+        reset_user_state(username)
+        return 200, "logged in"
 
+    # failed login
     ip_count, user_failures = record_failed_attempt(ip, username)
 
     if user_failures >= USER_MAX_ATTEMPTS:
         lock_user(username)
-        logger.warning("User %s reached failure threshold and was locked (from ip=%s)", username, ip)
-        return jsonify({"error": "account temporarily locked due to repeated failed logins"}), 423
+        return 423, "account temporarily locked due to repeated failed logins"
 
     if ip_count >= IP_MAX_ATTEMPTS // 2:
-        logger.info("IP %s approaching rate limit: %d/%d", ip, ip_count, IP_MAX_ATTEMPTS)
-        # Optionally require captcha here
+        # In a real app you'd require CAPTCHA or similar
+        pass
 
-    apply_backoff_delay(username)
+    if do_backoff:
+        apply_backoff(username)
 
-    return jsonify({"error": "invalid credentials"}), 401
+    return 401, "invalid credentials"
 
-@app.route("/admin/status/<username>", methods=["GET"])
-def admin_status(username):
-    locked = bool(store.get(user_lock_key(username)))
-    failures = store.get(user_failure_key(username)) or 0
-    backoff = store.get(user_backoff_key(username)) or 0
-    return jsonify({"username": username, "locked": locked, "failures": failures, "backoff": backoff})
+# CLI helpers
+def run_demo_sequence(target_username="alice", passwords=None, ips=None, rounds=1, delay=0.5):
+    """
+    Simulate password attempts from a small set of IPs.
+    - passwords: list of passwords to try
+    - ips: list of IP strings to simulate (round-robin)
+    """
+    if passwords is None:
+        passwords = ["wrong1", "wrong2", "wrong3", "wrong4", "wrong5", "s3cret"]
+    if ips is None:
+        ips = ["10.0.0.1"]  # default single IP
+
+    attempt = 0
+    for r in range(rounds):
+        print(f"\n--- Round {r+1}/{rounds} ---")
+        for pwd in passwords:
+            attempt += 1
+            ip = random.choice(ips)
+            print(f"Attempt #{attempt} from ip={ip} username={target_username} password='{pwd}' ...", end=" ")
+            code, msg = simulate_login_attempt(ip, target_username, pwd)
+            print(f"-> {code} {msg}")
+            if code == 423 or (isinstance(msg, str) and "too many" in msg):
+                print("  [demo] server indicates lockout/rate-limit. Stopping further attempts.")
+                return
+            time.sleep(delay)
+    print("\nDemo sequence finished.\n")
+
+def interactive_mode():
+    print("Interactive mode. Type 'exit' to quit, 'status <user>' to view user status.")
+    while True:
+        try:
+            line = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting.")
+            return
+        if not line:
+            continue
+        if line.lower() in ("exit","quit"):
+            print("Exiting.")
+            return
+        if line.startswith("status "):
+            _, user = line.split(None, 1)
+            print(get_status(user))
+            continue
+        parts = line.split()
+        if len(parts) < 3:
+            print("Usage: <ip> <username> <password>   OR  status <username>")
+            continue
+        ip, user, pwd = parts[0], parts[1], " ".join(parts[2:])
+        code, msg = simulate_login_attempt(ip, user, pwd)
+        print(f"-> {code} {msg}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Brute-force protection simulator (no Flask/no Redis).")
+    parser.add_argument("--demo", action="store_true", help="Run a demo sequence (pre-configured attempts).")
+    parser.add_argument("--username", type=str, default="alice", help="Target username for demo/attempts.")
+    parser.add_argument("--rounds", type=int, default=2, help="Number of rounds when running demo.")
+    parser.add_argument("--delay", type=float, default=0.5, help="Seconds between demo attempts.")
+    parser.add_argument("--ips", type=str, default="10.0.0.1", help="Comma-separated list of IPs for demo (e.g. '1.2.3.4,5.6.7.8').")
+    parser.add_argument("--passwords", type=str, default=None, help="Comma-separated passwords list to try (default includes correct).")
+    parser.add_argument("--interactive", action="store_true", help="Run interactive prompt to perform single attempts manually.")
+    args = parser.parse_args()
+
+    if args.demo:
+        pwds = args.passwords.split(",") if args.passwords else None
+        ips = [p.strip() for p in args.ips.split(",") if p.strip()]
+        run_demo_sequence(target_username=args.username, passwords=pwds, ips=ips, rounds=args.rounds, delay=args.delay)
+        return
+
+    if args.interactive:
+        interactive_mode()
+        return
+
+    print("No mode selected. Use --demo or --interactive. See --help for options.")
 
 if __name__ == "__main__":
-    print("Starting Flask on 127.0.0.1:5000 (debug mode, no reloader) ...")
-    app.run(host="127.0.0.1", port=5000, debug=True, use_reloader=False)
+    main()
