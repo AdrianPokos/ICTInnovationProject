@@ -1,7 +1,7 @@
 # importing all necessary files
 
 from bruteforcing import mainbrute
-from xxe import mainxxe
+from xxe_detectorv1 import mainxxe
 from ebe import mainebe
 from malwaressti import mainssti
 from bruteforcing import run_demo_sequence
@@ -45,6 +45,10 @@ def main():
 
   else:
     print("Please select an appropriate number.")
+
+
+  # to add here - there will be a function to call tests.py here to display the functionality of differnet 
+  # scenarios conducted through our proposed solution
   
 if __name__ == "__main__":
   main()
