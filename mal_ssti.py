@@ -1,0 +1,108 @@
+# Malware SSTI Monitor with Auto-Remove - Ava Carruthers
+# Monitors directory and automatically removes suspicious files (>5MB or .exe)
+
+# -------------------------------------------------
+# If running OWASP JuiceBox with Docker, use the following altered command:
+# sudo docker run -d -p 3000:3000 \
+#  -v /tmp/juicebox-uploads:/juice-shop/uploads \
+#  bkimminich/juice-shop
+# -------------------------------------------------
+
+import os
+import time
+import argparse
+
+# Configuration
+MONITOR_DIR = "/home/ava/juice-shop/uploads/complaints" # Change to match directory you'd like to scan
+SUSPICIOUS_SIZE_MB = 5
+CHECK_INTERVAL = 1  # Number of seconds between each scan
+
+def scan_directory(path):
+    """Return a set of filenames currently in the directory."""
+    try:
+        return set(os.listdir(path))
+    except FileNotFoundError:
+        print(f"[!] Directory not found: {path}")
+        return set()
+
+def detect_and_remove_suspicious_files(path):
+    """Detect and automatically remove suspicious files (too large or .exe)."""
+    flagged = []
+    
+    try:
+        files = os.listdir(path)
+    except FileNotFoundError:
+        return flagged
+    
+    for f in files:
+        full = os.path.join(path, f)
+        reasons = []
+        should_remove = False
+       
+        # Check if it's an .exe file
+        if f.lower().endswith('.exe'):
+            reasons.append("EXE file")
+            should_remove = True
+       
+        # Check file size
+        try:
+            size_mb = os.path.getsize(full) / (1024 * 1024)
+            if size_mb >= SUSPICIOUS_SIZE_MB:
+                reasons.append(f"{size_mb:.2f} MB")
+                should_remove = True
+        except FileNotFoundError:
+            continue
+       
+        # If suspicious, flag and remove it
+        if should_remove:
+            flagged.append((f, reasons))
+            try:
+                os.remove(full)
+                print(f"[REMOVED] {f} - Reason: {', '.join(reasons)}")
+            except Exception as e:
+                print(f"[ERROR] Failed to remove {f}: {e}")
+   
+    return flagged
+
+def main():
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="Monitor directory for suspicious files and auto-remove")
+    parser.add_argument('--quiet', '-q', action='store_true',
+                        help='Disable notifications for all new files (only show suspicious files)')
+    args = parser.parse_args()
+   
+    print(f"[*] Monitoring directory: {MONITOR_DIR}")
+    print(f"[*] Suspicious file threshold: {SUSPICIOUS_SIZE_MB} MB")
+    print(f"[*] AUTO-REMOVE ENABLED for:")
+    print(f"    - Files >= {SUSPICIOUS_SIZE_MB} MB")
+    print(f"    - .exe files")
+    print(f"[*] Notification mode: {'QUIET (suspicious only)' if args.quiet else 'VERBOSE (all new files)'}")
+    print(f"[*] Check interval: {CHECK_INTERVAL} seconds")
+    print("[*] Press Ctrl+C to exit\n")
+   
+    known_files = scan_directory(MONITOR_DIR)
+   
+    try:
+        while True:
+            current_files = scan_directory(MONITOR_DIR)
+           
+            # Detect newly added files
+            new_files = current_files - known_files
+           
+            # Show new file notifications (unless in quiet mode)
+            if new_files and not args.quiet:
+                for f in new_files:
+                    print(f"[NEW] File detected: {f}")
+           
+            # Detect and automatically remove suspicious files
+            detect_and_remove_suspicious_files(MONITOR_DIR)
+           
+            # Update known files after potential removals
+            known_files = scan_directory(MONITOR_DIR)
+            time.sleep(CHECK_INTERVAL)
+           
+    except KeyboardInterrupt: 
+        print("\n[x] Monitoring stopped by user.")
+
+if __name__ == "__main__":
+    main()
